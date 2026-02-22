@@ -52,6 +52,8 @@ Homepage = "https://github.com/QuentinFuxa/WhisperLiveKit"
 [project.scripts]
 whisperlivekit-server = "whisperlivekit.basic_server:main"
 wlk = "whisperlivekit.basic_server:main"
+wlk-control-api = "wlk_control.api:main"
+wlk-bridge-worker = "wlk_control.bridge_worker:main"
 
 [tool.setuptools]
 packages = [
@@ -64,7 +66,8 @@ packages = [
     "whisperlivekit.whisper.normalizers",
     "whisperlivekit.web",
     "whisperlivekit.local_agreement",
-    "whisperlivekit.silero_vad_models"
+    "whisperlivekit.silero_vad_models",
+    "wlk_control"
 ]
 
 [tool.setuptools.package-data]
