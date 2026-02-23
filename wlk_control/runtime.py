@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
+import socket
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -74,6 +77,11 @@ class RuntimeManager:
         self.bridge_process: Optional[ManagedProcess] = None
         self.active_profile_id: Optional[str] = None
         self.last_error: str = ""
+        self.startup_phase: str = "idle"
+        self.startup_message: str = ""
+        self.startup_started_at: Optional[str] = None
+        self.startup_updated_at: Optional[str] = None
+        self.last_preflight: Optional[dict[str, Any]] = None
 
     async def command_preview(self, profile: RuntimeProfile) -> dict[str, Any]:
         return {
@@ -84,6 +92,139 @@ class RuntimeManager:
             "bridgeWsUrl": self._build_bridge_ws_url(profile),
         }
 
+    async def preflight(self, profile: RuntimeProfile) -> dict[str, Any]:
+        checks: list[dict[str, Any]] = []
+
+        def add_check(name: str, ok: bool, message: str, severity: str = "error") -> None:
+            checks.append(
+                {
+                    "name": name,
+                    "ok": ok,
+                    "severity": severity,
+                    "message": message,
+                }
+            )
+
+        add_check(
+            "python_executable",
+            Path(sys.executable).exists(),
+            f"Python executable: {sys.executable}",
+        )
+
+        wlk_port_ok, wlk_port_reason = self._check_port_available(profile.wlk.host, profile.wlk.port)
+        add_check(
+            "wlk_port",
+            wlk_port_ok,
+            f"{profile.wlk.host}:{profile.wlk.port} {'available' if wlk_port_ok else f'not available ({wlk_port_reason})'}",
+        )
+
+        bridge_port_ok, bridge_port_reason = self._check_port_available(
+            profile.bridge.listen_host,
+            profile.bridge.listen_port,
+        )
+        add_check(
+            "bridge_port",
+            bridge_port_ok,
+            (
+                f"{profile.bridge.listen_host}:{profile.bridge.listen_port} "
+                f"{'available' if bridge_port_ok else f'not available ({bridge_port_reason})'}"
+            ),
+        )
+
+        ffmpeg_ok, ffmpeg_message = await self._check_ffmpeg_available(profile.bridge.ffmpeg_path)
+        add_check("ffmpeg", ffmpeg_ok, ffmpeg_message)
+
+        model_dir = (profile.wlk.model_dir or "").strip()
+        if model_dir:
+            model_path = Path(model_dir).expanduser()
+            model_exists = model_path.exists()
+            add_check(
+                "model_dir_exists",
+                model_exists,
+                f"model_dir {'exists' if model_exists else f'missing: {model_path}'}",
+            )
+
+            if model_exists:
+                try:
+                    from whisperlivekit.model_paths import detect_model_format
+
+                    info = detect_model_format(model_path)
+                    has_detected_weights = (
+                        info.has_pytorch
+                        or info.compatible_faster_whisper
+                        or info.compatible_whisper_mlx
+                    )
+                    add_check(
+                        "model_dir_format",
+                        has_detected_weights,
+                        (
+                            "model format check: "
+                            f"pytorch={info.has_pytorch}, "
+                            f"faster_whisper={info.compatible_faster_whisper}, "
+                            f"whisper_mlx={info.compatible_whisper_mlx}"
+                        ),
+                        severity="warning",
+                    )
+                except Exception as exc:
+                    add_check(
+                        "model_dir_format",
+                        False,
+                        f"model format detection failed: {exc}",
+                        severity="warning",
+                    )
+        else:
+            model_name = (profile.wlk.model or "").strip()
+            if not model_name:
+                add_check("model_name", False, "model is required when model_dir is empty")
+            else:
+                try:
+                    from whisperlivekit.whisper import available_models
+
+                    is_official = model_name in available_models()
+                    add_check(
+                        "model_name",
+                        True,
+                        (
+                            f"model '{model_name}' "
+                            f"{'is an official model id' if is_official else 'will be treated as custom/hf reference'}"
+                        ),
+                        severity="warning" if not is_official else "error",
+                    )
+                except Exception as exc:
+                    add_check(
+                        "model_name",
+                        True,
+                        f"model catalog lookup skipped: {exc}",
+                        severity="warning",
+                    )
+
+        model_cache_dir = (profile.wlk.model_cache_dir or "").strip()
+        if model_cache_dir:
+            cache_ok, cache_message = self._check_directory_writable(Path(model_cache_dir).expanduser())
+            add_check("model_cache_dir", cache_ok, cache_message)
+
+        audio_device = profile.bridge.audio_device.strip()
+        add_check(
+            "audio_device",
+            bool(audio_device),
+            f"audio device: {audio_device or '<empty>'}",
+        )
+
+        errors = [item for item in checks if item["severity"] == "error" and not item["ok"]]
+        warnings = [item for item in checks if item["severity"] == "warning" and not item["ok"]]
+
+        result = {
+            "profileId": profile.id,
+            "ok": len(errors) == 0,
+            "timestamp": utc_now_iso(),
+            "checks": checks,
+            "errorCount": len(errors),
+            "warningCount": len(warnings),
+        }
+
+        self.last_preflight = result
+        return result
+
     async def start(self, profile: RuntimeProfile) -> dict[str, Any]:
         async with self.lock:
             if self._is_running_unlocked():
@@ -91,29 +232,46 @@ class RuntimeManager:
 
             self.last_error = ""
             self.active_profile_id = profile.id
+            await self._set_startup_phase("preflight", "Running preflight checks")
+
+            preflight_result = await self.preflight(profile)
+            if not preflight_result["ok"]:
+                failed_checks = [
+                    item for item in preflight_result["checks"] if item["severity"] == "error" and not item["ok"]
+                ]
+                reason = "; ".join([f"{item['name']}: {item['message']}" for item in failed_checks])
+                self.last_error = f"Preflight failed: {reason}"
+                await self._set_startup_phase("failed", self.last_error)
+                raise RuntimeError(self.last_error)
 
             try:
+                await self._set_startup_phase("starting_wlk", "Launching WhisperLiveKit process")
                 self.wlk_process = await self._spawn_process(
                     name="wlk",
                     command=self._build_wlk_command(profile),
                     cwd=self.repo_root,
                 )
 
+                await self._set_startup_phase("waiting_wlk", "Waiting for WLK websocket readiness")
                 await self._wait_for_wlk_ready(profile)
 
+                await self._set_startup_phase("starting_bridge", "Launching bridge process")
                 self.bridge_process = await self._spawn_process(
                     name="bridge",
                     command=self._build_bridge_command(profile),
                     cwd=self.repo_root,
                 )
 
+                await self._set_startup_phase("waiting_bridge", "Waiting for bridge websocket readiness")
                 await self._wait_for_bridge_ready(profile)
+                await self._set_startup_phase("ready", "Runtime is ready")
                 await self.log_hub.publish("runtime started")
 
             except Exception as exc:
                 self.last_error = str(exc)
+                await self._set_startup_phase("failed", self.last_error)
                 await self.log_hub.publish(f"runtime failed to start: {exc}")
-                await self._stop_unlocked()
+                await self._stop_unlocked(reset_startup=False)
                 raise
 
         return await self.status(include_health=True)
@@ -128,26 +286,43 @@ class RuntimeManager:
             await self._stop_unlocked()
             self.last_error = ""
             self.active_profile_id = profile.id
+            await self._set_startup_phase("preflight", "Running preflight checks")
+
+            preflight_result = await self.preflight(profile)
+            if not preflight_result["ok"]:
+                failed_checks = [
+                    item for item in preflight_result["checks"] if item["severity"] == "error" and not item["ok"]
+                ]
+                reason = "; ".join([f"{item['name']}: {item['message']}" for item in failed_checks])
+                self.last_error = f"Preflight failed: {reason}"
+                await self._set_startup_phase("failed", self.last_error)
+                raise RuntimeError(self.last_error)
 
             try:
+                await self._set_startup_phase("starting_wlk", "Launching WhisperLiveKit process")
                 self.wlk_process = await self._spawn_process(
                     name="wlk",
                     command=self._build_wlk_command(profile),
                     cwd=self.repo_root,
                 )
+                await self._set_startup_phase("waiting_wlk", "Waiting for WLK websocket readiness")
                 await self._wait_for_wlk_ready(profile)
 
+                await self._set_startup_phase("starting_bridge", "Launching bridge process")
                 self.bridge_process = await self._spawn_process(
                     name="bridge",
                     command=self._build_bridge_command(profile),
                     cwd=self.repo_root,
                 )
+                await self._set_startup_phase("waiting_bridge", "Waiting for bridge websocket readiness")
                 await self._wait_for_bridge_ready(profile)
+                await self._set_startup_phase("ready", "Runtime is ready")
                 await self.log_hub.publish("runtime restarted")
             except Exception as exc:
                 self.last_error = str(exc)
+                await self._set_startup_phase("failed", self.last_error)
                 await self.log_hub.publish(f"runtime failed to restart: {exc}")
-                await self._stop_unlocked()
+                await self._stop_unlocked(reset_startup=False)
                 raise
 
         return await self.status(include_health=True)
@@ -204,12 +379,15 @@ class RuntimeManager:
             code = await managed.process.wait()
         await self.log_hub.publish(f"{managed.name} exited (code={code})")
 
-    async def _stop_unlocked(self) -> None:
+    async def _stop_unlocked(self, reset_startup: bool = True) -> None:
         await self._stop_process(self.bridge_process)
         self.bridge_process = None
 
         await self._stop_process(self.wlk_process)
         self.wlk_process = None
+
+        if reset_startup:
+            self._set_startup_phase_unlocked("idle", "")
 
         await self.log_hub.publish("runtime stopped")
 
@@ -250,6 +428,13 @@ class RuntimeManager:
             "state": state,
             "activeProfileId": self.active_profile_id,
             "lastError": self.last_error,
+            "startup": {
+                "phase": self.startup_phase,
+                "message": self.startup_message,
+                "startedAt": self.startup_started_at,
+                "updatedAt": self.startup_updated_at,
+            },
+            "lastPreflight": self.last_preflight,
             "wlk": wlk_info,
             "bridge": bridge_info,
         }
@@ -276,6 +461,90 @@ class RuntimeManager:
     @staticmethod
     def _proc_running(managed: ManagedProcess) -> bool:
         return managed.process.returncode is None
+
+    async def _set_startup_phase(self, phase: str, message: str) -> None:
+        self._set_startup_phase_unlocked(phase, message)
+        line = f"[startup:{phase}] {message}" if message else f"[startup:{phase}]"
+        await self.log_hub.publish(line)
+
+    def _set_startup_phase_unlocked(self, phase: str, message: str) -> None:
+        now = utc_now_iso()
+        active_startup_phases = {
+            "preflight",
+            "starting_wlk",
+            "waiting_wlk",
+            "starting_bridge",
+            "waiting_bridge",
+        }
+
+        if phase in active_startup_phases:
+            if self.startup_started_at is None or self.startup_phase in {"idle", "ready", "failed"}:
+                self.startup_started_at = now
+        elif phase == "idle":
+            self.startup_started_at = None
+
+        self.startup_phase = phase
+        self.startup_message = message
+        self.startup_updated_at = now
+
+    @staticmethod
+    def _check_port_available(host: str, port: int) -> tuple[bool, str]:
+        if not host:
+            return False, "host is empty"
+        if port < 1 or port > 65535:
+            return False, f"invalid port: {port}"
+
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((host, port))
+            return True, "ok"
+        except OSError as exc:
+            return False, str(exc)
+
+    @staticmethod
+    def _resolve_executable(path_or_name: str) -> Optional[str]:
+        candidate = Path(path_or_name).expanduser()
+        if candidate.exists():
+            return str(candidate.resolve())
+        return shutil.which(path_or_name)
+
+    async def _check_ffmpeg_available(self, ffmpeg_path: str) -> tuple[bool, str]:
+        resolved = self._resolve_executable(ffmpeg_path)
+        if not resolved:
+            return False, f"ffmpeg executable not found: {ffmpeg_path}"
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                resolved,
+                "-version",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            return False, f"ffmpeg check timed out: {resolved}"
+        except Exception as exc:
+            return False, f"ffmpeg check failed: {exc}"
+
+        if process.returncode != 0:
+            return False, f"ffmpeg check exited with code {process.returncode}: {resolved}"
+        return True, f"ffmpeg ready: {resolved}"
+
+    @staticmethod
+    def _check_directory_writable(path: Path) -> tuple[bool, str]:
+        if path.exists():
+            if not path.is_dir():
+                return False, f"path is not a directory: {path}"
+            writable = os.access(path, os.W_OK)
+            return writable, f"directory {'writable' if writable else 'not writable'}: {path}"
+
+        parent = path.parent
+        if not parent.exists():
+            return False, f"parent directory does not exist: {parent}"
+
+        writable = os.access(parent, os.W_OK)
+        return writable, f"parent directory {'writable' if writable else 'not writable'}: {parent}"
 
     async def _wait_for_wlk_ready(self, profile: RuntimeProfile) -> None:
         ws_url = self._build_wlk_ws_url(profile)

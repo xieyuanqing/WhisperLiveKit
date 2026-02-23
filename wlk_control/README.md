@@ -26,6 +26,7 @@ You can override it with:
 ## Runtime Endpoints
 
 - `GET /api/runtime/status?includeHealth=true`
+- `POST /api/runtime/preflight` with `{"profile_id":"jp-loopback-default"}`
 - `POST /api/runtime/start` with `{"profile_id":"jp-loopback-default"}`
 - `POST /api/runtime/stop`
 - `POST /api/runtime/restart` with `{"profile_id":"..."}`
@@ -64,6 +65,7 @@ You can override it with:
 
 - If loopback capture fails on your machine, update profile `bridge.audio_device` to a specific device.
 - The control API starts WLK first, then bridge, and monitors both via health checks.
+- Runtime status now includes `startup.phase/message` and `lastPreflight` for startup diagnostics.
 - LiveCaptions-Translator should use `ASR Source = Whisper Bridge` and `Whisper Bridge URL = ws://127.0.0.1:8765/captions`.
 - Managed models are stored under `WhisperLiveKit/.wlk-control/models` by default.
 - Registered external model paths are references only (no file copy / no file move).

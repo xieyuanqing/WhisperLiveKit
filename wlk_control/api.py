@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 from wlk_control.model_manager import ModelManager, ModelRegistryStore
 from wlk_control.models import (CommandPreviewPayload, ModelDownloadPayload,
                                 ModelPathDetailsPayload, ModelRegisterPayload, ProfilePayload,
-                                RestartPayload, StartPayload)
+                                RestartPayload, RuntimePreflightPayload, StartPayload)
 from wlk_control.profile_store import ProfileStore
 from wlk_control.runtime import LogHub, RuntimeManager, utc_now_iso
 
@@ -197,6 +197,14 @@ async def runtime_status(
     include_health: bool = Query(default=True, alias="includeHealth"),
 ) -> dict:
     return await runtime_manager.status(include_health=include_health)
+
+
+@app.post("/api/runtime/preflight")
+async def runtime_preflight(payload: RuntimePreflightPayload) -> dict:
+    profile = profile_store.get_profile(payload.profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail=f"Profile not found: {payload.profile_id}")
+    return await runtime_manager.preflight(profile)
 
 
 @app.post("/api/runtime/command-preview")

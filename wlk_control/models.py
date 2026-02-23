@@ -58,6 +58,10 @@ class RestartPayload(BaseModel):
     profile_id: Optional[str] = None
 
 
+class RuntimePreflightPayload(BaseModel):
+    profile_id: str
+
+
 class CommandPreviewPayload(BaseModel):
     profile_id: str
 
