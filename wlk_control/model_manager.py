@@ -276,6 +276,49 @@ class ModelManager:
         data["officialModels"] = available_models()
         return data
 
+    def inspect_path(self, path: str) -> dict:
+        candidate = path.strip()
+        if not candidate:
+            raise ValueError("path is required")
+
+        raw_path = Path(candidate).expanduser()
+        normalized = raw_path.resolve(strict=False)
+
+        details = {
+            "inputPath": path,
+            "normalizedPath": str(normalized),
+            "exists": raw_path.exists(),
+            "isFile": raw_path.is_file(),
+            "isDirectory": raw_path.is_dir(),
+            "managedDir": str(self.store.managed_models_dir.resolve()),
+            "underManagedDir": self.store._is_under_managed_dir(normalized),
+            "detection": {
+                "hasPytorch": False,
+                "pytorchFiles": [],
+                "compatibleWhisperMlx": False,
+                "compatibleFasterWhisper": False,
+            },
+            "detectionError": "",
+        }
+
+        if not details["exists"]:
+            return details
+
+        try:
+            from whisperlivekit.model_paths import detect_model_format
+
+            info = detect_model_format(raw_path)
+            details["detection"] = {
+                "hasPytorch": info.has_pytorch,
+                "pytorchFiles": [str(item.resolve()) for item in info.pytorch_files],
+                "compatibleWhisperMlx": info.compatible_whisper_mlx,
+                "compatibleFasterWhisper": info.compatible_faster_whisper,
+            }
+        except Exception as exc:
+            details["detectionError"] = str(exc)
+
+        return details
+
     def register_path(self, path: str, name: Optional[str] = None) -> dict:
         model = self.store.register_external_path(path=path, name=name)
         return self._model_to_response(model)
@@ -372,7 +415,7 @@ class ModelManager:
         if not url:
             raise RuntimeError(f"Could not resolve download URL for model: {model_id}")
         downloaded_file = _download(url, str(target_dir), in_memory=False)
-        checkpoint_path = Path(downloaded_file).resolve()
+        checkpoint_path = Path(str(downloaded_file)).resolve()
 
         model_path = checkpoint_path if checkpoint_path.exists() else target_dir.resolve()
         return self.store.register_managed_model(

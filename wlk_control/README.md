@@ -45,6 +45,7 @@ You can override it with:
 
 - `GET /api/models/catalog`
 - `POST /api/models/register-path` with `{"path":"C:\\models\\foo","name":"optional"}`
+- `POST /api/models/path-details` with `{"path":"C:\\models\\foo"}`
 - `DELETE /api/models/register/{modelId}` (remove registration only)
 - `DELETE /api/models/managed/{modelId}` (delete managed file/folder + registration)
 - `POST /api/models/download` with `{"source":"official","model_id":"small"}`

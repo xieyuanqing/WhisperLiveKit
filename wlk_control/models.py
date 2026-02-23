@@ -67,6 +67,10 @@ class ModelRegisterPayload(BaseModel):
     name: Optional[str] = None
 
 
+class ModelPathDetailsPayload(BaseModel):
+    path: str
+
+
 class ModelDownloadPayload(BaseModel):
     source: Literal["official", "huggingface"] = "official"
     model_id: str

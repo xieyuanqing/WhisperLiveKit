@@ -14,7 +14,7 @@ from fastapi.responses import StreamingResponse
 
 from wlk_control.model_manager import ModelManager, ModelRegistryStore
 from wlk_control.models import (CommandPreviewPayload, ModelDownloadPayload,
-                                ModelRegisterPayload, ProfilePayload,
+                                ModelPathDetailsPayload, ModelRegisterPayload, ProfilePayload,
                                 RestartPayload, StartPayload)
 from wlk_control.profile_store import ProfileStore
 from wlk_control.runtime import LogHub, RuntimeManager, utc_now_iso
@@ -136,6 +136,14 @@ async def models_register_path(payload: ModelRegisterPayload) -> dict:
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/models/path-details")
+async def models_path_details(payload: ModelPathDetailsPayload) -> dict:
+    try:
+        return model_manager.inspect_path(path=payload.path)
+    except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
