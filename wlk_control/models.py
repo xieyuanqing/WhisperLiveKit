@@ -28,9 +28,8 @@ class BridgeConfig(BaseModel):
     listen_path: str = "/captions"
     wlk_ws_url: Optional[str] = None
     ffmpeg_path: str = "ffmpeg"
-    ffmpeg_format: str = "wasapi"
+    ffmpeg_format: str = "dshow"
     audio_device: str = "default"
-    loopback: bool = True
     sample_rate: int = 16000
     channels: int = 1
     chunk_ms: int = 100
@@ -62,6 +61,12 @@ class RuntimePreflightPayload(BaseModel):
     profile_id: str
 
 
+class RuntimeAudioDevicesPayload(BaseModel):
+    ffmpeg_path: str = "ffmpeg"
+    ffmpeg_format: str = "dshow"
+    audio_device: Optional[str] = None
+
+
 class CommandPreviewPayload(BaseModel):
     profile_id: str
 
@@ -89,8 +94,8 @@ class ProfileStoreData(BaseModel):
 def build_default_profile() -> RuntimeProfile:
     return RuntimeProfile(
         id="jp-loopback-default",
-        name="JP Live Loopback",
-        description="Low-latency Japanese live stream profile with system loopback capture.",
+        name="JP Live Capture",
+        description="Low-latency Japanese live stream profile with local audio capture.",
         wlk=WlkConfig(
             host="127.0.0.1",
             port=8000,
@@ -109,9 +114,8 @@ def build_default_profile() -> RuntimeProfile:
             listen_port=8765,
             listen_path="/captions",
             ffmpeg_path="ffmpeg",
-            ffmpeg_format="wasapi",
+            ffmpeg_format="dshow",
             audio_device="default",
-            loopback=True,
             sample_rate=16000,
             channels=1,
             chunk_ms=100,

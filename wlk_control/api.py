@@ -15,7 +15,8 @@ from fastapi.responses import StreamingResponse
 from wlk_control.model_manager import ModelManager, ModelRegistryStore
 from wlk_control.models import (CommandPreviewPayload, ModelDownloadPayload,
                                 ModelPathDetailsPayload, ModelRegisterPayload, ProfilePayload,
-                                RestartPayload, RuntimePreflightPayload, StartPayload)
+                                RestartPayload, RuntimeAudioDevicesPayload,
+                                RuntimePreflightPayload, StartPayload)
 from wlk_control.profile_store import ProfileStore
 from wlk_control.runtime import LogHub, RuntimeManager, utc_now_iso
 
@@ -205,6 +206,18 @@ async def runtime_preflight(payload: RuntimePreflightPayload) -> dict:
     if not profile:
         raise HTTPException(status_code=404, detail=f"Profile not found: {payload.profile_id}")
     return await runtime_manager.preflight(profile)
+
+
+@app.post("/api/runtime/audio-devices")
+async def runtime_audio_devices(payload: RuntimeAudioDevicesPayload) -> dict:
+    try:
+        return await runtime_manager.inspect_audio_devices(
+            ffmpeg_path=payload.ffmpeg_path,
+            ffmpeg_format=payload.ffmpeg_format,
+            audio_device=payload.audio_device or "default",
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/runtime/command-preview")

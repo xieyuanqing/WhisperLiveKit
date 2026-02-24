@@ -4,10 +4,13 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 import signal
+import shutil
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional, Set
 
 try:
@@ -34,7 +37,6 @@ class BridgeConfig:
     ffmpeg_path: str
     ffmpeg_format: str
     audio_device: str
-    loopback: bool
     sample_rate: int
     channels: int
     chunk_ms: int
@@ -45,11 +47,13 @@ class BridgeConfig:
 class CaptionBridge:
     def __init__(self, config: BridgeConfig) -> None:
         self.config = config
+        self.ffmpeg_executable = self._resolve_ffmpeg_executable(config.ffmpeg_path)
         self.stop_event = asyncio.Event()
         self.clients: Set[WebSocketServerProtocol] = set()
         self.clients_lock = asyncio.Lock()
         self.ffmpeg_process: Optional[asyncio.subprocess.Process] = None
         self.ffmpeg_stderr_task: Optional[asyncio.Task] = None
+        self._resolved_capture: Optional[tuple[str, str]] = None
 
     async def run(self) -> None:
         self._register_signal_handlers()
@@ -180,22 +184,21 @@ class CaptionBridge:
         if self.ffmpeg_process and self.ffmpeg_process.returncode is None:
             return self.ffmpeg_process
 
+        ffmpeg_format, audio_device = await self._resolve_capture_settings()
+
         cmd = [
-            self.config.ffmpeg_path,
+            self.ffmpeg_executable,
             "-hide_banner",
             "-loglevel",
             "warning",
             "-f",
-            self.config.ffmpeg_format,
+            ffmpeg_format,
         ]
-        if self.config.loopback and self.config.ffmpeg_format.lower() == "wasapi":
-            cmd.extend(["-loopback", "1"])
-
         cmd.extend(self.config.ffmpeg_args)
         cmd.extend(
             [
                 "-i",
-                self.config.audio_device,
+                audio_device,
                 "-ac",
                 str(self.config.channels),
                 "-ar",
@@ -215,6 +218,123 @@ class CaptionBridge:
         self.ffmpeg_process = process
         self.ffmpeg_stderr_task = asyncio.create_task(self._read_ffmpeg_stderr(process))
         return process
+
+    async def _resolve_capture_settings(self) -> tuple[str, str]:
+        if self._resolved_capture is not None:
+            return self._resolved_capture
+
+        ffmpeg_format = (self.config.ffmpeg_format or "").strip() or "dshow"
+        audio_device = (self.config.audio_device or "").strip() or "default"
+
+        if ffmpeg_format.lower() == "wasapi":
+            logger.warning(
+                "wasapi is deprecated in this control plane; using dshow capture instead "
+                "(format=%s, device=%s)",
+                ffmpeg_format,
+                audio_device,
+            )
+            ffmpeg_format = "dshow"
+
+        if ffmpeg_format.lower() == "dshow":
+            audio_device = await self._normalize_dshow_audio_device(audio_device)
+
+        self._resolved_capture = (ffmpeg_format, audio_device)
+        return self._resolved_capture
+
+    async def _supports_input_format(self, format_name: str) -> bool:
+        output = await self._run_ffmpeg_probe(["-hide_banner", "-devices"])
+        if not output:
+            return False
+
+        pattern = re.compile(rf"^\s*D\S*\s+{re.escape(format_name)}\b", re.IGNORECASE | re.MULTILINE)
+        return bool(pattern.search(output))
+
+    async def _normalize_dshow_audio_device(self, audio_device: str) -> str:
+        raw = audio_device.strip()
+        if raw.lower().startswith("audio="):
+            return raw
+
+        if raw and raw.lower() != "default":
+            return f"audio={raw}"
+
+        devices = await self._list_dshow_audio_devices()
+        if not devices:
+            raise RuntimeError(
+                "No DirectShow audio device detected. Please set bridge.audio_device to a valid device name."
+            )
+
+        preferred_keywords = [
+            "cable output",
+            "stereo mix",
+            "what u hear",
+            "wave out",
+        ]
+        selected = devices[0]
+        for name in devices:
+            lower_name = name.lower()
+            if any(keyword in lower_name for keyword in preferred_keywords):
+                selected = name
+                break
+
+        logger.info("Using DirectShow audio device: %s", selected)
+        return f"audio={selected}"
+
+    async def _list_dshow_audio_devices(self) -> list[str]:
+        output = await self._run_ffmpeg_probe([
+            "-hide_banner",
+            "-list_devices",
+            "true",
+            "-f",
+            "dshow",
+            "-i",
+            "dummy",
+        ])
+        matches = re.findall(r'"([^"]+)"\s+\(audio\)', output)
+        unique: list[str] = []
+        for name in matches:
+            if name not in unique:
+                unique.append(name)
+        return unique
+
+    async def _run_ffmpeg_probe(self, args: list[str], timeout: float = 8.0) -> str:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                self.ffmpeg_executable,
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except FileNotFoundError:
+            return ""
+
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            return ""
+
+        if not stdout:
+            return ""
+        return stdout.decode("utf-8", errors="ignore")
+
+    @staticmethod
+    def _resolve_ffmpeg_executable(path_or_name: str) -> str:
+        value = (path_or_name or "").strip() or "ffmpeg"
+        candidate = Path(value).expanduser()
+        if candidate.exists():
+            if candidate.is_dir():
+                for executable_name in ("ffmpeg.exe", "ffmpeg"):
+                    nested = candidate / executable_name
+                    if nested.exists() and nested.is_file():
+                        return str(nested.resolve())
+                raise RuntimeError(f"ffmpeg executable not found under directory: {candidate}")
+            return str(candidate.resolve())
+
+        resolved = shutil.which(value)
+        if resolved:
+            return resolved
+        raise RuntimeError(f"ffmpeg executable not found: {path_or_name or 'ffmpeg'}")
 
     async def _read_ffmpeg_stderr(self, process: asyncio.subprocess.Process) -> None:
         if not process.stderr:
@@ -280,9 +400,8 @@ def parse_args() -> BridgeConfig:
     parser.add_argument("--listen-port", type=int, default=8765)
     parser.add_argument("--listen-path", default="/captions")
     parser.add_argument("--ffmpeg-path", default="ffmpeg")
-    parser.add_argument("--ffmpeg-format", default="wasapi")
+    parser.add_argument("--ffmpeg-format", default="dshow")
     parser.add_argument("--audio-device", default="default")
-    parser.add_argument("--loopback", action="store_true", default=False)
     parser.add_argument("--sample-rate", type=int, default=16000)
     parser.add_argument("--channels", type=int, default=1)
     parser.add_argument("--chunk-ms", type=int, default=100)
@@ -308,7 +427,6 @@ def parse_args() -> BridgeConfig:
         ffmpeg_path=args.ffmpeg_path,
         ffmpeg_format=args.ffmpeg_format,
         audio_device=args.audio_device,
-        loopback=args.loopback,
         sample_rate=max(8000, args.sample_rate),
         channels=max(1, args.channels),
         chunk_ms=max(20, args.chunk_ms),

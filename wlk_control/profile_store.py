@@ -136,6 +136,17 @@ class ProfileStore:
                 profiles=[default_profile],
             )
             self._write_unlocked(data)
+
+        changed = False
+        for profile in data.profiles:
+            format_value = (profile.bridge.ffmpeg_format or "").strip().lower()
+            if format_value in {"", "wasapi"}:
+                profile.bridge.ffmpeg_format = "dshow"
+                changed = True
+
+        if changed:
+            self._write_unlocked(data)
+
         return data
 
     def _write_unlocked(self, data: ProfileStoreData) -> None:

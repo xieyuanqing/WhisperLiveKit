@@ -5,7 +5,7 @@ This module provides a local control API that orchestrates two processes togethe
 1. `wlk` ASR server (`/asr`)
 2. `bridge_worker` audio-to-caption bridge (`/captions`)
 
-Designed for your workflow: system loopback audio -> WhisperLiveKit -> bridge -> LiveCaptions-Translator.
+Designed for your workflow: system/virtual audio capture -> WhisperLiveKit -> bridge -> LiveCaptions-Translator.
 
 ## Quick Start
 
@@ -27,6 +27,7 @@ You can override it with:
 
 - `GET /api/runtime/status?includeHealth=true`
 - `POST /api/runtime/preflight` with `{"profile_id":"jp-loopback-default"}`
+- `POST /api/runtime/audio-devices` with `{"ffmpeg_path":"ffmpeg","ffmpeg_format":"dshow","audio_device":"default"}`
 - `POST /api/runtime/start` with `{"profile_id":"jp-loopback-default"}`
 - `POST /api/runtime/stop`
 - `POST /api/runtime/restart` with `{"profile_id":"..."}`
@@ -59,11 +60,11 @@ You can override it with:
 - Bridge endpoint: `ws://127.0.0.1:8765/captions`
 - Default language: `ja`
 - Default model: `small`
-- Audio source: FFmpeg WASAPI loopback (`-f wasapi -loopback 1 -i default`)
+- Audio source: FFmpeg DirectShow capture (`-f dshow -i audio=<device>`)
 
 ## Notes
 
-- If loopback capture fails on your machine, update profile `bridge.audio_device` to a specific device.
+- Use `runtime/audio-devices` to discover local capture devices and set `bridge.audio_device` accordingly.
 - The control API starts WLK first, then bridge, and monitors both via health checks.
 - Runtime status now includes `startup.phase/message` and `lastPreflight` for startup diagnostics.
 - LiveCaptions-Translator should use `ASR Source = Whisper Bridge` and `Whisper Bridge URL = ws://127.0.0.1:8765/captions`.

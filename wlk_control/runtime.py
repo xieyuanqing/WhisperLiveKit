@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import socket
 import sys
@@ -90,6 +91,87 @@ class RuntimeManager:
             "bridgeCommand": self._build_bridge_command(profile),
             "wlkWsUrl": self._build_wlk_ws_url(profile),
             "bridgeWsUrl": self._build_bridge_ws_url(profile),
+        }
+
+    async def inspect_audio_devices(
+        self,
+        ffmpeg_path: str,
+        ffmpeg_format: str,
+        audio_device: str,
+    ) -> dict[str, Any]:
+        requested_format = (ffmpeg_format or "dshow").strip().lower() or "dshow"
+        requested_device = (audio_device or "default").strip() or "default"
+        resolved_ffmpeg = self._resolve_executable((ffmpeg_path or "ffmpeg").strip() or "ffmpeg")
+        if not resolved_ffmpeg:
+            raise RuntimeError(f"ffmpeg executable not found: {ffmpeg_path or 'ffmpeg'}")
+
+        supports_requested = await self._supports_input_format(resolved_ffmpeg, requested_format)
+        supports_dshow = await self._supports_input_format(resolved_ffmpeg, "dshow")
+
+        effective_format = requested_format
+        warnings: list[str] = []
+        if requested_format == "wasapi":
+            warnings.append("wasapi is deprecated in this control plane and has been normalized to dshow.")
+            if supports_dshow:
+                effective_format = "dshow"
+            else:
+                warnings.append("Current ffmpeg does not support dshow input format.")
+        elif not supports_requested:
+            if supports_dshow:
+                effective_format = "dshow"
+                warnings.append(
+                    f"Current ffmpeg does not support '{requested_format}' input; fallback to dshow."
+                )
+            else:
+                warnings.append(
+                    f"Current ffmpeg does not support '{requested_format}' input and dshow is unavailable."
+                )
+
+        devices: list[dict[str, str]] = []
+        suggested_device = requested_device
+
+        if effective_format == "dshow" and supports_dshow:
+            dshow_devices = await self._list_dshow_audio_devices(resolved_ffmpeg)
+            devices = [
+                {
+                    "label": name,
+                    "value": f"audio={name}",
+                }
+                for name in dshow_devices
+            ]
+
+            if requested_device.lower() == "default":
+                if dshow_devices:
+                    suggested_device = f"audio={self._pick_preferred_dshow_device(dshow_devices)}"
+            elif not requested_device.lower().startswith("audio="):
+                suggested_device = f"audio={requested_device}"
+
+        if effective_format != "dshow" and not devices:
+            devices = [{"label": requested_device, "value": requested_device}]
+
+        if not devices and requested_device:
+            devices = [{"label": requested_device, "value": requested_device}]
+
+        if suggested_device and not any(item["value"] == suggested_device for item in devices):
+            devices.insert(
+                0,
+                {
+                    "label": f"Current ({suggested_device})",
+                    "value": suggested_device,
+                },
+            )
+
+        return {
+            "ffmpegPath": resolved_ffmpeg,
+            "requestedFormat": requested_format,
+            "effectiveFormat": effective_format,
+            "supports": {
+                "requestedFormat": supports_requested,
+                "dshow": supports_dshow,
+            },
+            "devices": devices,
+            "suggestedAudioDevice": suggested_device,
+            "warnings": warnings,
         }
 
     async def preflight(self, profile: RuntimeProfile) -> dict[str, Any]:
@@ -504,10 +586,20 @@ class RuntimeManager:
 
     @staticmethod
     def _resolve_executable(path_or_name: str) -> Optional[str]:
-        candidate = Path(path_or_name).expanduser()
+        value = (path_or_name or "").strip()
+        if not value:
+            return None
+
+        candidate = Path(value).expanduser()
         if candidate.exists():
+            if candidate.is_dir():
+                for executable_name in ("ffmpeg.exe", "ffmpeg"):
+                    nested = candidate / executable_name
+                    if nested.exists() and nested.is_file():
+                        return str(nested.resolve())
+                return None
             return str(candidate.resolve())
-        return shutil.which(path_or_name)
+        return shutil.which(value)
 
     async def _check_ffmpeg_available(self, ffmpeg_path: str) -> tuple[bool, str]:
         resolved = self._resolve_executable(ffmpeg_path)
@@ -530,6 +622,71 @@ class RuntimeManager:
         if process.returncode != 0:
             return False, f"ffmpeg check exited with code {process.returncode}: {resolved}"
         return True, f"ffmpeg ready: {resolved}"
+
+    async def _supports_input_format(self, ffmpeg_path: str, format_name: str) -> bool:
+        output = await self._run_ffmpeg_probe(ffmpeg_path, ["-hide_banner", "-devices"])
+        if not output:
+            return False
+
+        pattern = re.compile(rf"^\s*D\S*\s+{re.escape(format_name)}\b", re.IGNORECASE | re.MULTILINE)
+        return bool(pattern.search(output))
+
+    async def _list_dshow_audio_devices(self, ffmpeg_path: str) -> list[str]:
+        output = await self._run_ffmpeg_probe(
+            ffmpeg_path,
+            [
+                "-hide_banner",
+                "-list_devices",
+                "true",
+                "-f",
+                "dshow",
+                "-i",
+                "dummy",
+            ],
+        )
+        matches = re.findall(r'"([^"]+)"\s+\(audio\)', output)
+        unique: list[str] = []
+        for name in matches:
+            if name not in unique:
+                unique.append(name)
+        return unique
+
+    @staticmethod
+    def _pick_preferred_dshow_device(devices: list[str]) -> str:
+        preferred_keywords = [
+            "cable output",
+            "stereo mix",
+            "what u hear",
+            "wave out",
+        ]
+        for name in devices:
+            lowered = name.lower()
+            if any(keyword in lowered for keyword in preferred_keywords):
+                return name
+        return devices[0]
+
+    @staticmethod
+    async def _run_ffmpeg_probe(ffmpeg_path: str, args: list[str], timeout: float = 8.0) -> str:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                ffmpeg_path,
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except FileNotFoundError:
+            return ""
+
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            return ""
+
+        if not stdout:
+            return ""
+        return stdout.decode("utf-8", errors="ignore")
 
     @staticmethod
     def _check_directory_writable(path: Path) -> tuple[bool, str]:
@@ -686,7 +843,7 @@ class RuntimeManager:
             "--ffmpeg-path",
             bridge.ffmpeg_path,
             "--ffmpeg-format",
-            bridge.ffmpeg_format,
+            self._normalize_ffmpeg_format(bridge.ffmpeg_format),
             "--audio-device",
             bridge.audio_device,
             "--sample-rate",
@@ -699,13 +856,19 @@ class RuntimeManager:
             str(bridge.reconnect_ms),
         ]
 
-        if bridge.loopback:
-            command.append("--loopback")
-
         for arg in bridge.extra_ffmpeg_args:
             command.extend(["--ffmpeg-arg", arg])
 
         return command
+
+    @staticmethod
+    def _normalize_ffmpeg_format(value: str) -> str:
+        normalized = (value or "").strip()
+        if not normalized:
+            return "dshow"
+        if normalized.lower() == "wasapi":
+            return "dshow"
+        return normalized
 
     @staticmethod
     def _build_wlk_ws_url(profile: RuntimeProfile) -> str:
