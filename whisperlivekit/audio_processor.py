@@ -553,7 +553,11 @@ class AudioProcessor:
 
         if not self.beg_loop:
             self.beg_loop = time()
-            self.current_silence = Silence(start=0.0, is_starting=True)
+            # VAC drives silence lifecycle; without VAC we stream all PCM directly.
+            if self.args.vac:
+                self.current_silence = Silence(start=0.0, is_starting=True)
+            else:
+                self.current_silence = None
             self.tokens_alignment.beg_loop = self.beg_loop
 
         if not message:
@@ -626,7 +630,7 @@ class AudioProcessor:
                     await self._enqueue_active_audio(pre_silence_chunk)
                 await self._begin_silence()
 
-        if not self.current_silence:
+        if not self.args.vac or not self.current_silence:
             await self._enqueue_active_audio(pcm_array)
 
         self.total_pcm_samples = chunk_sample_end

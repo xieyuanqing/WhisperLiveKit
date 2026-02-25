@@ -18,7 +18,7 @@ from wlk_control.models import (CommandPreviewPayload, ModelDownloadPayload,
                                 RestartPayload, RuntimeAudioDevicesPayload,
                                 RuntimePreflightPayload, StartPayload)
 from wlk_control.profile_store import ProfileStore
-from wlk_control.runtime import LogHub, RuntimeManager, utc_now_iso
+from wlk_control.runtime import LogHub, MeterHub, RuntimeManager, utc_now_iso
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -28,8 +28,9 @@ MODEL_REGISTRY_FILE = CONTROL_HOME / "models_registry.json"
 MANAGED_MODELS_DIR = CONTROL_HOME / "models"
 
 log_hub = LogHub(max_queue_size=800)
+meter_hub = MeterHub(max_queue_size=200)
 profile_store = ProfileStore(PROFILE_FILE)
-runtime_manager = RuntimeManager(REPO_ROOT, log_hub)
+runtime_manager = RuntimeManager(REPO_ROOT, log_hub, meter_hub)
 model_registry_store = ModelRegistryStore(MODEL_REGISTRY_FILE, MANAGED_MODELS_DIR)
 model_manager = ModelManager(model_registry_store)
 
@@ -277,6 +278,28 @@ async def runtime_logs_stream() -> StreamingResponse:
                     yield "event: ping\ndata: {\"ok\":true}\n\n"
         finally:
             await log_hub.unsubscribe(queue)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/api/runtime/meter/stream")
+async def runtime_meter_stream() -> StreamingResponse:
+    queue = await meter_hub.subscribe()
+    latest = await meter_hub.latest()
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        try:
+            if latest is not None:
+                yield f"data: {json.dumps(latest, ensure_ascii=False)}\n\n"
+
+            while True:
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=15)
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                except asyncio.TimeoutError:
+                    yield "event: ping\ndata: {\"ok\":true}\n\n"
+        finally:
+            await meter_hub.unsubscribe(queue)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

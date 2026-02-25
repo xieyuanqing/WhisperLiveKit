@@ -69,10 +69,54 @@ class LogHub:
             self._queues.discard(queue)
 
 
+class MeterHub:
+    def __init__(self, max_queue_size: int = 120) -> None:
+        self.max_queue_size = max(10, max_queue_size)
+        self._queues: set[asyncio.Queue[dict[str, Any]]] = set()
+        self._lock = asyncio.Lock()
+        self._latest: Optional[dict[str, Any]] = None
+
+    async def publish(self, payload: dict[str, Any]) -> None:
+        async with self._lock:
+            self._latest = dict(payload)
+            stale: list[asyncio.Queue[dict[str, Any]]] = []
+            for queue in self._queues:
+                if queue.full():
+                    try:
+                        queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+
+                try:
+                    queue.put_nowait(dict(payload))
+                except asyncio.QueueFull:
+                    stale.append(queue)
+
+            for queue in stale:
+                self._queues.discard(queue)
+
+    async def latest(self) -> Optional[dict[str, Any]]:
+        async with self._lock:
+            if self._latest is None:
+                return None
+            return dict(self._latest)
+
+    async def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=self.max_queue_size)
+        async with self._lock:
+            self._queues.add(queue)
+        return queue
+
+    async def unsubscribe(self, queue: asyncio.Queue[dict[str, Any]]) -> None:
+        async with self._lock:
+            self._queues.discard(queue)
+
+
 class RuntimeManager:
-    def __init__(self, repo_root: Path, log_hub: LogHub) -> None:
+    def __init__(self, repo_root: Path, log_hub: LogHub, meter_hub: Optional[MeterHub] = None) -> None:
         self.repo_root = repo_root
         self.log_hub = log_hub
+        self.meter_hub = meter_hub or MeterHub()
         self.lock = asyncio.Lock()
         self.wlk_process: Optional[ManagedProcess] = None
         self.bridge_process: Optional[ManagedProcess] = None
@@ -454,6 +498,10 @@ class RuntimeManager:
                 break
             message = line.decode("utf-8", errors="ignore").rstrip()
             if message:
+                meter_payload = self._extract_bridge_meter_payload(managed.name, message)
+                if meter_payload is not None:
+                    await self.meter_hub.publish(meter_payload)
+                    continue
                 await self.log_hub.publish(f"[{managed.name}] {message}")
 
         code = managed.process.returncode
@@ -489,6 +537,32 @@ class RuntimeManager:
         if managed.reader_task:
             managed.reader_task.cancel()
             await asyncio.gather(managed.reader_task, return_exceptions=True)
+
+    @staticmethod
+    def _extract_bridge_meter_payload(process_name: str, message: str) -> Optional[dict[str, Any]]:
+        if process_name != "bridge":
+            return None
+
+        marker = "bridge_meter "
+        marker_index = message.find(marker)
+        if marker_index < 0:
+            return None
+
+        raw_payload = message[marker_index + len(marker) :].strip()
+        if not raw_payload:
+            return None
+
+        try:
+            payload = json.loads(raw_payload)
+        except json.JSONDecodeError:
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("type") != "bridge_meter":
+            return None
+
+        return payload
 
     def _is_running_unlocked(self) -> bool:
         return self.wlk_process is not None and self.bridge_process is not None and self._proc_running(

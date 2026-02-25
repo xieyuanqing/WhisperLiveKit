@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import re
 import signal
 import shutil
@@ -54,6 +55,7 @@ class CaptionBridge:
         self.ffmpeg_process: Optional[asyncio.subprocess.Process] = None
         self.ffmpeg_stderr_task: Optional[asyncio.Task] = None
         self._resolved_capture: Optional[tuple[str, str]] = None
+        self._last_meter_emit_at: float = 0.0
 
     async def run(self) -> None:
         self._register_signal_handlers()
@@ -168,6 +170,7 @@ class CaptionBridge:
                 chunk = await process.stdout.read(chunk_size)
                 if chunk:
                     await upstream.send(chunk)
+                    await self._maybe_emit_audio_meter(chunk)
                     continue
 
                 if process.returncode is not None:
@@ -373,6 +376,63 @@ class CaptionBridge:
         if error:
             payload["error"] = error
         await self._broadcast(json.dumps(payload, ensure_ascii=False))
+
+    async def _maybe_emit_audio_meter(self, chunk: bytes) -> None:
+        now = asyncio.get_running_loop().time()
+        emit_interval = max(0.1, self.config.chunk_ms / 1000.0)
+        if now - self._last_meter_emit_at < emit_interval:
+            return
+
+        rms_db, peak_db = self._compute_audio_meter_db(chunk)
+        payload = {
+            "type": "bridge_meter",
+            "timestamp": utc_now_iso(),
+            "rms_db": round(rms_db, 1),
+            "peak_db": round(peak_db, 1),
+            "sample_rate": self.config.sample_rate,
+            "channels": self.config.channels,
+            "chunk_ms": self.config.chunk_ms,
+        }
+
+        logger.info("bridge_meter %s", json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        self._last_meter_emit_at = now
+
+    @staticmethod
+    def _compute_audio_meter_db(chunk: bytes) -> tuple[float, float]:
+        if not chunk:
+            return -96.0, -96.0
+
+        samples_count = len(chunk) // 2
+        if samples_count <= 0:
+            return -96.0, -96.0
+
+        try:
+            samples = memoryview(chunk)[: samples_count * 2].cast("h")
+        except TypeError:
+            return -96.0, -96.0
+
+        peak = 0
+        sum_squares = 0.0
+        for sample in samples:
+            amplitude = abs(int(sample))
+            if amplitude > peak:
+                peak = amplitude
+            sum_squares += float(amplitude * amplitude)
+
+        if sum_squares <= 0.0:
+            return -96.0, -96.0
+
+        rms = math.sqrt(sum_squares / samples_count)
+        rms_db = CaptionBridge._to_db(rms)
+        peak_db = CaptionBridge._to_db(float(peak))
+        return rms_db, peak_db
+
+    @staticmethod
+    def _to_db(amplitude: float) -> float:
+        if amplitude <= 0:
+            return -96.0
+        db = 20.0 * math.log10(amplitude / 32768.0)
+        return max(-96.0, min(0.0, db))
 
     async def _broadcast(self, message: str) -> None:
         async with self.clients_lock:
