@@ -8,6 +8,10 @@ from whisperlivekit.timed_objects import ASRToken, Sentence, Transcript
 
 logger = logging.getLogger(__name__)
 
+LONG_SILENCE_RESET_SEC = 1.2
+NO_COMMIT_FORCE_SEC = 1.6
+MAX_ACTIVE_NO_COMMIT_SEC = 13.0
+
 class HypothesisBuffer:
     """
     Buffer to store and process ASR hypothesis tokens.
@@ -85,6 +89,20 @@ class HypothesisBuffer:
         self.committed_in_buffer.extend(committed)
         return committed
 
+    def force_commit_buffer(self) -> List[ASRToken]:
+        """Force-commit the current buffer, used when input goes silent."""
+        if not self.buffer:
+            self.new = []
+            return []
+
+        forced = list(self.buffer)
+        self.committed_in_buffer.extend(forced)
+        self.last_committed_word = forced[-1].text
+        self.last_committed_time = forced[-1].end
+        self.buffer = []
+        self.new = []
+        return forced
+
     def pop_committed(self, time: float):
         """
         Remove tokens (from the beginning) that have ended before `time`.
@@ -126,6 +144,21 @@ class OnlineASRProcessor:
 
         self.buffer_trimming_way = asr.buffer_trimming
         self.buffer_trimming_sec = asr.buffer_trimming_sec
+        self.long_silence_reset_sec = max(
+            0.5,
+            float(getattr(asr, "long_silence_reset_sec", LONG_SILENCE_RESET_SEC)),
+        )
+        self.no_commit_force_sec = max(
+            0.5,
+            min(
+                float(getattr(asr, "no_commit_force_sec", NO_COMMIT_FORCE_SEC)),
+                self.buffer_trimming_sec,
+            ),
+        )
+        self.max_active_no_commit_sec = max(
+            self.no_commit_force_sec,
+            float(getattr(asr, "max_active_no_commit_sec", MAX_ACTIVE_NO_COMMIT_SEC)),
+        )
 
         if self.buffer_trimming_way not in ["sentence", "segment"]:
             raise ValueError("buffer_trimming must be either 'sentence' or 'segment'")
@@ -149,6 +182,7 @@ class OnlineASRProcessor:
         self.transcript_buffer.last_committed_time = self.buffer_time_offset
         self.committed: List[ASRToken] = []
         self.time_of_last_asr_output = 0.0
+        self._used_init_prompt = False
 
     def get_audio_buffer_end_time(self) -> float:
         """Returns the absolute end time of the current audio_buffer."""
@@ -160,14 +194,23 @@ class OnlineASRProcessor:
 
     def start_silence(self):
         if self.audio_buffer.size == 0:
-            return [], self.get_audio_buffer_end_time()
-        return self.process_iter()
+            forced = self._force_commit_pending_buffer()
+            return forced, self.get_audio_buffer_end_time()
+
+        committed, processed_upto = self.process_iter()
+        if committed:
+            return committed, processed_upto
+
+        # Silence just started, no new audio will arrive for prefix validation.
+        # Force-flush pending tokens so the UI does not keep stale pink drafts forever.
+        forced = self._force_commit_pending_buffer()
+        return forced, processed_upto
 
     def end_silence(self, silence_duration: Optional[float], offset: float):
         if not silence_duration or silence_duration <= 0:
             return
 
-        long_silence = silence_duration >= 5
+        long_silence = silence_duration >= self.long_silence_reset_sec
         if not long_silence:
             gap_samples = int(self.SAMPLING_RATE * silence_duration)
             if gap_samples > 0:
@@ -206,7 +249,21 @@ class OnlineASRProcessor:
             prompt_list.append(word)
         non_prompt_tokens = self.committed[k:]
         context_text = self.asr.sep.join(token.text for token in non_prompt_tokens)
-        return self.asr.sep.join(prompt_list[::-1]), context_text
+
+        prompt_text = self.asr.sep.join(prompt_list[::-1])
+        static_prompt = (getattr(self.asr, "static_init_prompt", None) or "").strip()
+        one_time_prompt = ""
+        if not self._used_init_prompt:
+            one_time_prompt = (getattr(self.asr, "init_prompt", None) or "").strip()
+            if one_time_prompt:
+                self._used_init_prompt = True
+
+        if static_prompt:
+            prompt_text = " ".join(part for part in [static_prompt, prompt_text] if part).strip()
+        if one_time_prompt:
+            prompt_text = " ".join(part for part in [one_time_prompt, prompt_text] if part).strip()
+
+        return prompt_text, context_text
 
     def get_buffer(self):
         """
@@ -240,13 +297,41 @@ class OnlineASRProcessor:
         incomp = self.concatenate_tokens(self.transcript_buffer.buffer)
         logger.debug(f"INCOMPLETE: {incomp.text}")
 
+        if not committed_tokens and self.transcript_buffer.buffer:
+            if self.time_of_last_asr_output > 0:
+                reference_time = self.time_of_last_asr_output
+                reference_label = "last_commit"
+            else:
+                # Cold-start/reset path: no previous commit exists yet.
+                # Use the first pending token start as timeout reference.
+                reference_time = self.transcript_buffer.buffer[0].start
+                reference_label = "buffer_start"
+
+            time_since_reference = max(0.0, self.get_audio_buffer_end_time() - reference_time)
+            if time_since_reference >= self.no_commit_force_sec:
+                logger.info(
+                    "No committed output for %.2fs (ref=%s), forcing pending buffer commit.",
+                    time_since_reference,
+                    reference_label,
+                )
+                committed_tokens = self._force_commit_pending_buffer()
+
         buffer_duration = len(self.audio_buffer) / self.SAMPLING_RATE
-        if not committed_tokens and buffer_duration > self.buffer_trimming_sec:
-            time_since_last_output = self.get_audio_buffer_end_time() - self.time_of_last_asr_output
-            if time_since_last_output > self.buffer_trimming_sec:
+        if not committed_tokens and not self.transcript_buffer.buffer:
+            if self.time_of_last_asr_output > 0:
+                no_output_reference = self.time_of_last_asr_output
+            else:
+                no_output_reference = self.buffer_time_offset
+            time_since_last_output = max(0.0, self.get_audio_buffer_end_time() - no_output_reference)
+            if (
+                buffer_duration > self.buffer_trimming_sec
+                and time_since_last_output > self.max_active_no_commit_sec
+            ):
                 logger.warning(
-                    f"No ASR output for {time_since_last_output:.2f}s. "
-                    f"Resetting buffer to prevent freezing."
+                    "No ASR output for %.2fs (max_active_no_commit_sec=%.2fs). "
+                    "Resetting buffer to prevent freezing.",
+                    time_since_last_output,
+                    self.max_active_no_commit_sec,
                 )
                 self.init(offset=self.get_audio_buffer_end_time())
                 return [], current_audio_processed_upto
@@ -266,6 +351,17 @@ class OnlineASRProcessor:
             for token in committed_tokens:
                 token = token.with_offset(self.global_time_offset)
         return committed_tokens, current_audio_processed_upto
+
+    def _force_commit_pending_buffer(self) -> List[ASRToken]:
+        forced_tokens = self.transcript_buffer.force_commit_buffer()
+        if forced_tokens:
+            self.committed.extend(forced_tokens)
+            self.time_of_last_asr_output = forced_tokens[-1].end
+            logger.debug(
+                "FORCED COMMIT ON SILENCE: %s",
+                self.asr.sep.join(token.text for token in forced_tokens),
+            )
+        return forced_tokens
 
     def chunk_completed_sentence(self):
         """
@@ -404,7 +500,7 @@ class OnlineASRProcessor:
         Flush the remaining transcript when processing ends.
         Returns a tuple: (list of remaining ASRToken objects, float representing the final audio processed up to time).
         """
-        remaining_tokens = self.transcript_buffer.buffer
+        remaining_tokens = self._force_commit_pending_buffer()
         logger.debug(f"Final non-committed tokens: {remaining_tokens}")
         final_processed_upto = self.buffer_time_offset + (len(self.audio_buffer) / self.SAMPLING_RATE)
         self.buffer_time_offset = final_processed_upto

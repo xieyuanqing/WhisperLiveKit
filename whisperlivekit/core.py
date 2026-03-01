@@ -128,6 +128,15 @@ class TranscriptionEngine:
                     "buffer_trimming": config.buffer_trimming,
                     "confidence_validation": config.confidence_validation,
                     "buffer_trimming_sec": config.buffer_trimming_sec,
+                    "long_silence_reset_sec": config.long_silence_reset_sec,
+                    "no_commit_force_sec": config.no_commit_force_sec,
+                    "max_active_no_commit_sec": config.max_active_no_commit_sec,
+                    "condition_on_previous_text": config.condition_on_previous_text,
+                    "compression_ratio_threshold": config.compression_ratio_threshold,
+                    "no_speech_threshold": config.no_speech_threshold,
+                    "init_prompt": config.init_prompt,
+                    "static_init_prompt": config.static_init_prompt,
+                    "vad": config.vad,
                 }
 
                 self.asr = backend_factory(

@@ -241,6 +241,25 @@ class AlignAtt(AlignAttBase):
             return torch.cat(self.state.segments, dim=0)
         return self.state.segments[0]
 
+    @staticmethod
+    def _to_numpy_encoder_feature(encoder_feature):
+        if isinstance(encoder_feature, np.ndarray):
+            return np.ascontiguousarray(encoder_feature)
+
+        converted = encoder_feature
+        if hasattr(converted, 'to_device'):
+            try:
+                import ctranslate2
+
+                converted = converted.to_device(ctranslate2.Device.cpu)
+            except Exception:
+                pass
+
+        array = np.asarray(converted)
+        if array.dtype == np.object_:
+            raise TypeError('Failed to convert ctranslate2 StorageView to numeric array')
+        return np.ascontiguousarray(array)
+
     def _encode(self, input_segments):
         if self.use_mlcore:
             coreml_encoder, coreml_input_name, coreml_output_name = self.coreml_encoder_tuple
@@ -277,16 +296,10 @@ class AlignAtt(AlignAttBase):
             )[None, :]
             mel = fw_pad_or_trim(mel_padded_2, N_FRAMES, axis=-1)
             encoder_feature_ctranslate = self.fw_encoder.encode(mel)
-            if self.device == 'cpu':
-                encoder_feature_ctranslate = np.array(encoder_feature_ctranslate)
-            try:
-                encoder_feature = torch.as_tensor(encoder_feature_ctranslate, device=self.device)
-            except TypeError:
-                # Some numpy/ctranslate2 versions produce object_ dtype arrays; force float32
-                arr = np.array(encoder_feature_ctranslate)
-                if arr.dtype == np.object_:
-                    arr = np.array(arr.tolist(), dtype=np.float32)
-                encoder_feature = torch.as_tensor(arr, device=self.device)
+            encoder_feature_np = self._to_numpy_encoder_feature(encoder_feature_ctranslate)
+            if self.device == 'cpu' and encoder_feature_np.dtype == np.float16:
+                encoder_feature_np = encoder_feature_np.astype(np.float32, copy=False)
+            encoder_feature = torch.as_tensor(encoder_feature_np, device=self.device)
         else:
             mel_padded = log_mel_spectrogram(
                 input_segments, n_mels=self.model.dims.n_mels,

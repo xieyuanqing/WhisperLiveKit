@@ -12,7 +12,7 @@ class WlkConfig(BaseModel):
     model_cache_dir: Optional[str] = None
     model_dir: Optional[str] = None
     language: str = "ja"
-    backend_policy: Literal["simulstreaming", "localagreement"] = "simulstreaming"
+    backend_policy: Literal["simulstreaming", "localagreement"] = "localagreement"
     backend: str = "auto"
     min_chunk_size: float = 0.1
     pcm_input: bool = True
@@ -101,7 +101,7 @@ def build_default_profile() -> RuntimeProfile:
             port=8000,
             model="small",
             language="ja",
-            backend_policy="simulstreaming",
+            backend_policy="localagreement",
             backend="auto",
             min_chunk_size=0.1,
             pcm_input=True,

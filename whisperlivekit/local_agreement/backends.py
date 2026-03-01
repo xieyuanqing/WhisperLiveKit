@@ -64,13 +64,14 @@ class WhisperASR(ASRBase):
         options.pop("vad", None)
         options.pop("vad_filter", None)
         language = self.original_language if self.original_language else None
+        condition_on_previous_text = bool(getattr(self, "condition_on_previous_text", False))
 
         result = whisper_transcribe(
             self.model,
             audio,
             language=language,
             initial_prompt=init_prompt,
-            condition_on_previous_text=True,
+            condition_on_previous_text=condition_on_previous_text,
             word_timestamps=True,
             **options,
         )
@@ -127,21 +128,33 @@ class FasterWhisperASR(ASRBase):
         return model
 
     def transcribe(self, audio: np.ndarray, init_prompt: str = "") -> list:
+        options = dict(self.transcribe_kargs)
+        condition_on_previous_text = bool(
+            options.pop(
+                "condition_on_previous_text",
+                getattr(self, "condition_on_previous_text", False),
+            )
+        )
         segments, info = self.model.transcribe(
             audio,
             language=self.original_language,
             initial_prompt=init_prompt,
             beam_size=5,
             word_timestamps=True,
-            condition_on_previous_text=True,
-            **self.transcribe_kargs,
+            condition_on_previous_text=condition_on_previous_text,
+            **options,
         )
         return list(segments)
 
     def ts_words(self, segments) -> List[ASRToken]:
+        threshold_value = self.transcribe_kargs.get(
+            "no_speech_threshold",
+            getattr(self, "no_speech_threshold", 0.9),
+        )
+        no_speech_threshold = float(threshold_value)
         tokens = []
         for segment in segments:
-            if segment.no_speech_prob > 0.9:
+            if segment.no_speech_prob > no_speech_threshold:
                 continue
             for word in segment.words:
                 token = ASRToken(word.start, word.end, word.word, probability=word.probability)
@@ -190,20 +203,22 @@ class MLXWhisper(ASRBase):
     def transcribe(self, audio, init_prompt=""):
         if self.transcribe_kargs:
             logger.warning("Transcribe kwargs (vad, task) are not compatible with MLX Whisper and will be ignored.")
+        condition_on_previous_text = bool(getattr(self, "condition_on_previous_text", False))
         segments = self.model(
             audio,
             language=self.original_language,
             initial_prompt=init_prompt,
             word_timestamps=True,
-            condition_on_previous_text=True,
+            condition_on_previous_text=condition_on_previous_text,
             path_or_hf_repo=self.model_size_or_path,
         )
         return segments.get("segments", [])
 
     def ts_words(self, segments) -> List[ASRToken]:
+        no_speech_threshold = float(getattr(self, "no_speech_threshold", 0.9))
         tokens = []
         for segment in segments:
-            if segment.get("no_speech_prob", 0) > 0.9:
+            if segment.get("no_speech_prob", 0) > no_speech_threshold:
                 continue
             for word in segment.get("words", []):
                 token = ASRToken(word["start"], word["end"], word["word"])

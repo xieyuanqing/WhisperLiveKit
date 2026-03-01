@@ -20,7 +20,8 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 SENTINEL = object() # unique sentinel object for end of stream marker
-MIN_DURATION_REAL_SILENCE = 5
+# Silence must be long enough to be a real utterance boundary.
+MIN_DURATION_REAL_SILENCE = 0.8
 
 async def get_all_from_queue(queue: asyncio.Queue) -> Union[object, Silence, np.ndarray, List[Any]]:
     items: List[Any] = []
@@ -89,11 +90,19 @@ class AudioProcessor:
         self.vac: Optional[FixedVADIterator] = None
 
         if self.args.vac:
+            vac_threshold = min(max(float(self.args.vac_threshold), 0.0), 1.0)
+            vac_min_silence_duration_ms = max(0, int(self.args.vac_min_silence_duration_ms))
+            vac_speech_pad_ms = max(0, int(self.args.vac_speech_pad_ms))
+            vac_iterator_args = {
+                "threshold": vac_threshold,
+                "min_silence_duration_ms": vac_min_silence_duration_ms,
+                "speech_pad_ms": vac_speech_pad_ms,
+            }
             if models.vac_session is not None:
                 vac_model = OnnxWrapper(session=models.vac_session)
-                self.vac = FixedVADIterator(vac_model)
+                self.vac = FixedVADIterator(vac_model, **vac_iterator_args)
             else:
-                self.vac = FixedVADIterator(load_jit_vad())
+                self.vac = FixedVADIterator(load_jit_vad(), **vac_iterator_args)
         self.ffmpeg_manager: Optional[FFmpegManager] = None
         self.ffmpeg_reader_task: Optional[asyncio.Task] = None
         self._ffmpeg_error: Optional[str] = None
@@ -132,12 +141,24 @@ class AudioProcessor:
             self.translation = online_translation_factory(self.args, models.translation_model)
 
     async def _push_silence_event(self) -> None:
+        if not self.current_silence:
+            return
+
+        def clone_silence(silence: Silence) -> Silence:
+            return Silence(
+                start=silence.start,
+                end=silence.end,
+                duration=silence.duration,
+                is_starting=silence.is_starting,
+                has_ended=silence.has_ended,
+            )
+
         if self.transcription_queue:
-            await self.transcription_queue.put(self.current_silence)
+            await self.transcription_queue.put(clone_silence(self.current_silence))
         if self.args.diarization and self.diarization_queue:
-            await self.diarization_queue.put(self.current_silence)
+            await self.diarization_queue.put(clone_silence(self.current_silence))
         if self.translation_queue:
-            await self.translation_queue.put(self.current_silence)
+            await self.translation_queue.put(clone_silence(self.current_silence))
 
     async def _begin_silence(self) -> None:
         if self.current_silence:
@@ -263,6 +284,29 @@ class AudioProcessor:
                 item = await get_all_from_queue(self.transcription_queue)
                 if item is SENTINEL:
                     logger.debug("Transcription processor received sentinel. Finishing.")
+                    final_tokens = []
+                    final_processed_upto = self.state.end_buffer
+                    final_buffer = self.state.buffer_transcription
+
+                    if self.transcription:
+                        try:
+                            final_tokens, final_processed_upto = self.transcription.finish()
+                            final_buffer = self.transcription.get_buffer()
+                        except Exception as finish_error:
+                            logger.warning(f"Failed to finalize transcription buffer: {finish_error}")
+
+                    final_tokens = final_tokens or []
+                    async with self.lock:
+                        if final_tokens:
+                            self.state.tokens.extend(final_tokens)
+                            self.state.new_tokens.extend(final_tokens)
+                        self.state.buffer_transcription = final_buffer
+                        self.state.new_tokens_buffer = final_buffer
+                        self.state.end_buffer = max(self.state.end_buffer, final_processed_upto)
+
+                    if self.translation_queue and final_tokens:
+                        for token in final_tokens:
+                            await self.translation_queue.put(token)
                     break
 
                 asr_internal_buffer_duration_s = len(getattr(self.transcription, 'audio_buffer', [])) / self.transcription.SAMPLING_RATE

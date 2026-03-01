@@ -76,7 +76,16 @@ def backend_factory(
             direct_english_translation,
             buffer_trimming,
             buffer_trimming_sec,
+            long_silence_reset_sec,
+            no_commit_force_sec,
+            max_active_no_commit_sec,
+            condition_on_previous_text,
+            compression_ratio_threshold,
+            no_speech_threshold,
             confidence_validation,
+            vad=True,
+            init_prompt=None,
+            static_init_prompt=None,
             warmup_file=None,
             min_chunk_size=None,
         ):
@@ -157,6 +166,28 @@ def backend_factory(
     asr.tokenizer = tokenizer
     asr.buffer_trimming = buffer_trimming
     asr.buffer_trimming_sec = buffer_trimming_sec
+    asr.long_silence_reset_sec = max(0.3, float(long_silence_reset_sec))
+    asr.no_commit_force_sec = max(0.3, float(no_commit_force_sec))
+    asr.max_active_no_commit_sec = max(0.5, float(max_active_no_commit_sec))
+    asr.condition_on_previous_text = bool(condition_on_previous_text)
+    if compression_ratio_threshold is None:
+        asr.transcribe_kargs.pop("compression_ratio_threshold", None)
+    else:
+        asr.transcribe_kargs["compression_ratio_threshold"] = float(compression_ratio_threshold)
+    if no_speech_threshold is None:
+        asr.transcribe_kargs.pop("no_speech_threshold", None)
+        asr.no_speech_threshold = None
+    else:
+        threshold_value = float(no_speech_threshold)
+        asr.transcribe_kargs["no_speech_threshold"] = threshold_value
+        asr.no_speech_threshold = threshold_value
+    asr.init_prompt = init_prompt
+    asr.static_init_prompt = static_init_prompt
+    if vad:
+        asr.use_vad()
+    else:
+        asr.transcribe_kargs.pop("vad", None)
+        asr.transcribe_kargs.pop("vad_filter", None)
     asr.backend_choice = backend_choice
     return asr
 

@@ -2,6 +2,17 @@
 from argparse import ArgumentParser
 
 
+def _parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Expected boolean value, got: {value}")
+
+
 def parse_args():
     parser = ArgumentParser(description="Whisper FastAPI Online Server")
     parser.add_argument(
@@ -159,6 +170,27 @@ def parse_args():
     parser.add_argument(
         "--vac-chunk-size", type=float, default=0.04, help="VAC sample size in seconds."
     )
+    parser.add_argument(
+        "--vac-threshold",
+        type=float,
+        default=0.5,
+        dest="vac_threshold",
+        help="VAC speech probability threshold (higher = stricter speech detection).",
+    )
+    parser.add_argument(
+        "--vac-min-silence-duration-ms",
+        type=int,
+        default=100,
+        dest="vac_min_silence_duration_ms",
+        help="VAC minimum silence duration (ms) before ending speech.",
+    )
+    parser.add_argument(
+        "--vac-speech-pad-ms",
+        type=int,
+        default=30,
+        dest="vac_speech_pad_ms",
+        help="VAC padding (ms) added around detected speech boundaries.",
+    )
 
     parser.add_argument(
         "--no-vad",
@@ -178,6 +210,48 @@ def parse_args():
         type=float,
         default=15,
         help="Buffer trimming length threshold in seconds. If buffer length is longer, trimming sentence/segment is triggered.",
+    )
+    parser.add_argument(
+        "--long-silence-reset-sec",
+        type=float,
+        default=1.2,
+        dest="long_silence_reset_sec",
+        help="LocalAgreement: reset rolling context when silence duration exceeds this threshold (seconds).",
+    )
+    parser.add_argument(
+        "--no-commit-force-sec",
+        type=float,
+        default=1.6,
+        dest="no_commit_force_sec",
+        help="LocalAgreement: force-commit pending buffer when no final commit appears for this long (seconds).",
+    )
+    parser.add_argument(
+        "--max-active-no-commit-sec",
+        type=float,
+        default=13.0,
+        dest="max_active_no_commit_sec",
+        help="LocalAgreement watchdog: reset context when no commit appears for this long during active processing (seconds).",
+    )
+    parser.add_argument(
+        "--condition-on-previous-text",
+        type=_parse_bool,
+        default=False,
+        dest="condition_on_previous_text",
+        help="Whisper decoding: whether to condition decoding on previous text (true/false).",
+    )
+    parser.add_argument(
+        "--compression-ratio-threshold",
+        type=float,
+        default=None,
+        dest="compression_ratio_threshold",
+        help="Whisper decoding: compression ratio threshold for hallucination filtering.",
+    )
+    parser.add_argument(
+        "--no-speech-threshold",
+        type=float,
+        default=None,
+        dest="no_speech_threshold",
+        help="Whisper decoding: no-speech threshold (higher favors silence over uncertain text).",
     )
     parser.add_argument(
         "-l",

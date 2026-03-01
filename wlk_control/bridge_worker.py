@@ -156,7 +156,25 @@ class CaptionBridge:
         async for message in upstream:
             if isinstance(message, bytes):
                 continue
-            await self._broadcast(message)
+            await self._broadcast(self._normalize_caption_payload(message))
+
+    @staticmethod
+    def _normalize_caption_payload(message: str) -> str:
+        """Clamp legacy snapshot lines to a small rolling window."""
+        try:
+            payload = json.loads(message)
+        except json.JSONDecodeError:
+            return message
+
+        if not isinstance(payload, dict):
+            return message
+
+        lines = payload.get("lines")
+        if not isinstance(lines, list) or len(lines) <= 4:
+            return message
+
+        payload["lines"] = lines[-4:]
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
     async def _stream_audio_to_upstream(self, upstream) -> None:
         chunk_size = max(320, int(self.config.sample_rate * self.config.channels * 2 * self.config.chunk_ms / 1000))

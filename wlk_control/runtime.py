@@ -128,6 +128,130 @@ class RuntimeManager:
         self.startup_updated_at: Optional[str] = None
         self.last_preflight: Optional[dict[str, Any]] = None
 
+    @staticmethod
+    def _merge_path_entries(existing_path: str, prepend_entries: list[str]) -> str:
+        merged: list[str] = []
+        seen: set[str] = set()
+
+        def append_entry(entry: str) -> None:
+            value = (entry or "").strip()
+            if not value:
+                return
+            key = os.path.normcase(os.path.normpath(value))
+            if key in seen:
+                return
+            seen.add(key)
+            merged.append(value)
+
+        for entry in prepend_entries:
+            append_entry(entry)
+
+        for entry in existing_path.split(os.pathsep):
+            append_entry(entry)
+
+        return os.pathsep.join(merged)
+
+    @staticmethod
+    def _collect_cuda_runtime_paths() -> list[str]:
+        discovered: list[str] = []
+
+        def add(path: Path) -> None:
+            if path.exists() and path.is_dir():
+                discovered.append(str(path))
+
+        python_exe = Path(sys.executable).resolve()
+        python_dir = python_exe.parent
+        env_root = python_dir
+        if not (env_root / "python.exe").exists():
+            env_root = python_dir.parent
+
+        add(python_dir)
+        add(env_root)
+        add(env_root / "Library" / "bin")
+        add(env_root / "DLLs")
+
+        site_roots = [
+            env_root / "Lib" / "site-packages",
+            env_root / "lib" / "site-packages",
+        ]
+        for site_root in site_roots:
+            if not site_root.exists():
+                continue
+
+            add(site_root / "ctranslate2")
+
+            nvidia_root = site_root / "nvidia"
+            if nvidia_root.exists():
+                for child in nvidia_root.iterdir():
+                    add(child / "bin")
+
+        cuda_keys = ["CUDA_PATH"] + sorted(k for k in os.environ if k.startswith("CUDA_PATH_V"))
+        for key in cuda_keys:
+            raw = (os.environ.get(key) or "").strip()
+            if not raw:
+                continue
+            cuda_base = Path(raw)
+            add(cuda_base)
+            add(cuda_base / "bin")
+            add(cuda_base / "libnvvp")
+
+        ordered_unique = RuntimeManager._merge_path_entries("", discovered)
+        return ordered_unique.split(os.pathsep) if ordered_unique else []
+
+    def _build_launch_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        extra_paths = self._collect_cuda_runtime_paths()
+        env["PATH"] = self._merge_path_entries(env.get("PATH", ""), extra_paths)
+        return env
+
+    async def _check_faster_whisper_cuda_runtime(self) -> tuple[bool, str]:
+        if os.name != "nt":
+            return True, "faster-whisper CUDA runtime check skipped on non-Windows platform"
+
+        probe_script = (
+            "import whisperlivekit\n"
+            "import ctypes\n"
+            "import ctranslate2\n"
+            "count = ctranslate2.get_cuda_device_count()\n"
+            "if count < 1:\n"
+            "    raise RuntimeError('no_cuda_device')\n"
+            "ctypes.WinDLL('cublas64_12.dll')\n"
+            "print(f'ok_cuda_devices={count}')\n"
+        )
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                probe_script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=self._build_launch_env(),
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=15)
+        except asyncio.TimeoutError:
+            return False, "faster-whisper CUDA probe timed out"
+        except Exception as exc:
+            return False, f"faster-whisper CUDA probe failed to execute: {exc}"
+
+        output = (stdout or b"").decode("utf-8", errors="ignore").strip()
+        if process.returncode == 0:
+            if output:
+                return True, f"faster-whisper CUDA ready ({output})"
+            return True, "faster-whisper CUDA runtime is available"
+
+        lower_output = output.lower()
+        if "cublas64_12.dll" in lower_output:
+            return (
+                False,
+                "cublas64_12.dll is missing from runtime PATH; install nvidia-cublas-cu12 and restart control API",
+            )
+        if "no_cuda_device" in lower_output:
+            return False, "no CUDA device visible to ctranslate2"
+
+        message = output or f"exit code {process.returncode}"
+        return False, f"faster-whisper CUDA probe failed: {message}"
+
     async def command_preview(self, profile: RuntimeProfile) -> dict[str, Any]:
         return {
             "profileId": profile.id,
@@ -329,6 +453,39 @@ class RuntimeManager:
             cache_ok, cache_message = self._check_directory_writable(Path(model_cache_dir).expanduser())
             add_check("model_cache_dir", cache_ok, cache_message)
 
+        backend_policy = (profile.wlk.backend_policy or "").strip().lower()
+        backend = (profile.wlk.backend or "").strip().lower()
+        if backend_policy == "simulstreaming" and backend in {"auto", "faster-whisper"}:
+            cuda_ok, cuda_message = await self._check_faster_whisper_cuda_runtime()
+            add_check(
+                "faster_whisper_cuda",
+                cuda_ok,
+                cuda_message,
+                severity="error" if backend == "faster-whisper" else "warning",
+            )
+
+            try:
+                import torch
+
+                torch_cuda_ok = bool(torch.cuda.is_available())
+                add_check(
+                    "simulstreaming_decoder_cuda",
+                    torch_cuda_ok,
+                    (
+                        "PyTorch CUDA is available for SimulStreaming decoder"
+                        if torch_cuda_ok
+                        else "PyTorch CUDA is unavailable, so SimulStreaming decoder runs on CPU (encoder can still use faster-whisper CUDA)"
+                    ),
+                    severity="warning",
+                )
+            except Exception as exc:
+                add_check(
+                    "simulstreaming_decoder_cuda",
+                    False,
+                    f"Unable to inspect PyTorch CUDA availability: {exc}",
+                    severity="warning",
+                )
+
         audio_device = profile.bridge.audio_device.strip()
         add_check(
             "audio_device",
@@ -371,11 +528,14 @@ class RuntimeManager:
                 raise RuntimeError(self.last_error)
 
             try:
+                launch_env = self._build_launch_env()
+
                 await self._set_startup_phase("starting_wlk", "Launching WhisperLiveKit process")
                 self.wlk_process = await self._spawn_process(
                     name="wlk",
                     command=self._build_wlk_command(profile),
                     cwd=self.repo_root,
+                    env=launch_env,
                 )
 
                 await self._set_startup_phase("waiting_wlk", "Waiting for WLK websocket readiness")
@@ -386,6 +546,7 @@ class RuntimeManager:
                     name="bridge",
                     command=self._build_bridge_command(profile),
                     cwd=self.repo_root,
+                    env=launch_env,
                 )
 
                 await self._set_startup_phase("waiting_bridge", "Waiting for bridge websocket readiness")
@@ -425,11 +586,14 @@ class RuntimeManager:
                 raise RuntimeError(self.last_error)
 
             try:
+                launch_env = self._build_launch_env()
+
                 await self._set_startup_phase("starting_wlk", "Launching WhisperLiveKit process")
                 self.wlk_process = await self._spawn_process(
                     name="wlk",
                     command=self._build_wlk_command(profile),
                     cwd=self.repo_root,
+                    env=launch_env,
                 )
                 await self._set_startup_phase("waiting_wlk", "Waiting for WLK websocket readiness")
                 await self._wait_for_wlk_ready(profile)
@@ -439,6 +603,7 @@ class RuntimeManager:
                     name="bridge",
                     command=self._build_bridge_command(profile),
                     cwd=self.repo_root,
+                    env=launch_env,
                 )
                 await self._set_startup_phase("waiting_bridge", "Waiting for bridge websocket readiness")
                 await self._wait_for_bridge_ready(profile)
@@ -468,12 +633,19 @@ class RuntimeManager:
 
         return snapshot
 
-    async def _spawn_process(self, name: str, command: list[str], cwd: Path) -> ManagedProcess:
+    async def _spawn_process(
+        self,
+        name: str,
+        command: list[str],
+        cwd: Path,
+        env: Optional[dict[str, str]] = None,
+    ) -> ManagedProcess:
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=str(cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            env=env,
         )
 
         managed = ManagedProcess(
@@ -869,6 +1041,8 @@ class RuntimeManager:
             config.host,
             "--port",
             str(config.port),
+            "--model",
+            config.model,
             "--language",
             config.language,
             "--backend-policy",
@@ -883,8 +1057,6 @@ class RuntimeManager:
 
         if config.model_dir:
             command.extend(["--model_dir", config.model_dir])
-        else:
-            command.extend(["--model", config.model])
 
         if config.model_cache_dir:
             command.extend(["--model_cache_dir", config.model_cache_dir])

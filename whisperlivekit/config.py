@@ -22,6 +22,9 @@ class WhisperLiveKitConfig:
     target_language: str = ""
     vac: bool = True
     vac_chunk_size: float = 0.04
+    vac_threshold: float = 0.5
+    vac_min_silence_duration_ms: int = 100
+    vac_speech_pad_ms: int = 30
     log_level: str = "DEBUG"
     ssl_certfile: Optional[str] = None
     ssl_keyfile: Optional[str] = None
@@ -49,6 +52,12 @@ class WhisperLiveKitConfig:
     buffer_trimming: str = "segment"
     confidence_validation: bool = False
     buffer_trimming_sec: float = 15.0
+    long_silence_reset_sec: float = 1.2
+    no_commit_force_sec: float = 1.6
+    max_active_no_commit_sec: float = 13.0
+    condition_on_previous_text: bool = False
+    compression_ratio_threshold: Optional[float] = None
+    no_speech_threshold: Optional[float] = None
 
     # SimulStreaming-specific
     disable_fast_encoder: bool = False
