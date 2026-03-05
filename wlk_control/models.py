@@ -5,21 +5,44 @@ from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
+def build_default_wlk_extra_args() -> List[str]:
+    return [
+        "--buffer_trimming_sec",
+        "4",
+        "--long-silence-reset-sec",
+        "1.5",
+        "--max-active-no-commit-sec",
+        "13",
+        "--condition-on-previous-text",
+        "false",
+        "--beams",
+        "1",
+        "--no-speech-threshold",
+        "0.9",
+        "--compression-ratio-threshold",
+        "2.025",
+        "--vac-min-silence-duration-ms",
+        "200",
+        "--no-commit-force-sec",
+        "1.84",
+    ]
+
+
 class WlkConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8000
-    model: str = "small"
+    model: str = "large-v3-turbo"
     model_cache_dir: Optional[str] = None
     model_dir: Optional[str] = None
     language: str = "ja"
     backend_policy: Literal["simulstreaming", "localagreement"] = "localagreement"
-    backend: str = "auto"
+    backend: str = "faster-whisper"
     min_chunk_size: float = 0.1
     pcm_input: bool = True
     diarization: bool = False
     vad: bool = True
     vac: bool = True
-    extra_args: List[str] = Field(default_factory=list)
+    extra_args: List[str] = Field(default_factory=build_default_wlk_extra_args)
 
 
 class BridgeConfig(BaseModel):
@@ -99,15 +122,16 @@ def build_default_profile() -> RuntimeProfile:
         wlk=WlkConfig(
             host="127.0.0.1",
             port=8000,
-            model="small",
+            model="large-v3-turbo",
             language="ja",
             backend_policy="localagreement",
-            backend="auto",
+            backend="faster-whisper",
             min_chunk_size=0.1,
             pcm_input=True,
             diarization=False,
             vad=True,
             vac=True,
+            extra_args=build_default_wlk_extra_args(),
         ),
         bridge=BridgeConfig(
             listen_host="127.0.0.1",
