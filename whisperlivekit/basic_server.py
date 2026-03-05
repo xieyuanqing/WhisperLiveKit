@@ -4,10 +4,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
 
-from whisperlivekit import (AudioProcessor, TranscriptionEngine,
-                            get_inline_ui_html, parse_args)
+from whisperlivekit import AudioProcessor, TranscriptionEngine, parse_args
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logging.getLogger().setLevel(logging.WARNING)
@@ -34,7 +32,11 @@ app.add_middleware(
 
 @app.get("/")
 async def get():
-    return HTMLResponse(get_inline_ui_html())
+    return {
+        "ok": True,
+        "message": "Bundled browser UI has been removed. Use your separate frontend console or connect to /asr directly.",
+        "websocket": "/asr",
+    }
 
 
 async def handle_websocket_results(websocket, results_generator):
