@@ -151,8 +151,6 @@ class FasterWhisperASR(ASRBase):
             "no_speech_threshold",
             getattr(self, "no_speech_threshold", 0.9),
         )
-        if threshold_value is None:
-            threshold_value = 0.9
         no_speech_threshold = float(threshold_value)
         tokens = []
         for segment in segments:
@@ -217,10 +215,7 @@ class MLXWhisper(ASRBase):
         return segments.get("segments", [])
 
     def ts_words(self, segments) -> List[ASRToken]:
-        threshold_value = getattr(self, "no_speech_threshold", 0.9)
-        if threshold_value is None:
-            threshold_value = 0.9
-        no_speech_threshold = float(threshold_value)
+        no_speech_threshold = float(getattr(self, "no_speech_threshold", 0.9))
         tokens = []
         for segment in segments:
             if segment.get("no_speech_prob", 0) > no_speech_threshold:
