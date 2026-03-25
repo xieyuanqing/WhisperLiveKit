@@ -33,6 +33,12 @@ flowchart LR
 
 ## 推荐工作流
 
+跨仓库默认端点、共享运行约定和 Bridge 稳定字段现在以 `C:\Users\XYQ\whisper-stack\` 下的标准文档为准，尤其是：
+
+- `C:\Users\XYQ\whisper-stack\README.md`
+- `C:\Users\XYQ\whisper-stack\cross-repo-contracts.md`
+- `C:\Users\XYQ\whisper-stack\change-rules.md`
+
 如果你只是想快速体验原始 WLK，可直接启动服务：
 
 ```bash
@@ -45,7 +51,7 @@ wlk --model large-v3-turbo --language ja --backend-policy localagreement --backe
 2. 在控制台里维护 Profile 和模型
 3. 通过前检查确认 FFmpeg、模型和音频设备
 4. 一键启动 WLK + Bridge
-5. 把下游字幕器连到 `ws://127.0.0.1:8765/captions`
+5. 把下游字幕器连到本地 Bridge WebSocket，当前默认是 `ws://127.0.0.1:8765/captions`
 
 ## 快速开始
 
@@ -67,7 +73,7 @@ pip install whisperlivekit
 wlk-control-api --host 127.0.0.1 --port 18700
 ```
 
-默认控制 API 地址：`http://127.0.0.1:18700/api`
+默认控制 API 地址当前是 `http://127.0.0.1:18700/api`。如果后续有跨仓库调整，请以 `C:\Users\XYQ\whisper-stack\cross-repo-contracts.md` 为准。
 
 默认会在仓库根目录下创建：
 
@@ -79,7 +85,7 @@ wlk-control-api --host 127.0.0.1 --port 18700
 
 前端控制台在单独仓库 `v0-whisper-live-kit`。
 
-它默认连接 `http://127.0.0.1:18700/api`，可以在界面里完成：
+它默认连接当前控制 API 地址 `http://127.0.0.1:18700/api`，可以在界面里完成：
 
 - Profile 编辑
 - 模型管理
@@ -93,11 +99,13 @@ wlk-control-api --host 127.0.0.1 --port 18700
 wlk --model large-v3-turbo --language ja --backend-policy localagreement --backend faster-whisper
 ```
 
-默认 WebSocket 入口：`ws://127.0.0.1:8000/asr`
+默认 WebSocket 入口当前是 `ws://127.0.0.1:8000/asr`。共享默认值的最终定义在 `C:\Users\XYQ\whisper-stack\cross-repo-contracts.md`。
 
 `GET /` 现在只返回一个简单状态说明，不再自带浏览器录音页面。
 
 ## 控制平面默认 Profile
+
+下面这些值保留为本仓库当前默认工作流的本地说明。跨仓库共享默认值和变更约束请看 `C:\Users\XYQ\whisper-stack\cross-repo-contracts.md` 与 `C:\Users\XYQ\whisper-stack\change-rules.md`。
 
 控制平面当前默认的 JP live Profile 重点值如下：
 
