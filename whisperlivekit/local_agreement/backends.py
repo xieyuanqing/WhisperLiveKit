@@ -129,6 +129,14 @@ class FasterWhisperASR(ASRBase):
 
     def transcribe(self, audio: np.ndarray, init_prompt: str = "") -> list:
         options = dict(self.transcribe_kargs)
+        beam_size = options.pop(
+            "beam_size",
+            getattr(self, "beams", getattr(self, "beam_size", 5)),
+        )
+        try:
+            beam_size = max(1, int(beam_size))
+        except Exception:
+            beam_size = 5
         condition_on_previous_text = bool(
             options.pop(
                 "condition_on_previous_text",
@@ -139,7 +147,7 @@ class FasterWhisperASR(ASRBase):
             audio,
             language=self.original_language,
             initial_prompt=init_prompt,
-            beam_size=5,
+            beam_size=beam_size,
             word_timestamps=True,
             condition_on_previous_text=condition_on_previous_text,
             **options,

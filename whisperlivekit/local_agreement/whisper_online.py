@@ -79,6 +79,7 @@ def backend_factory(
             long_silence_reset_sec,
             no_commit_force_sec,
             max_active_no_commit_sec,
+            beams,
             condition_on_previous_text,
             compression_ratio_threshold,
             no_speech_threshold,
@@ -169,6 +170,8 @@ def backend_factory(
     asr.long_silence_reset_sec = max(0.3, float(long_silence_reset_sec))
     asr.no_commit_force_sec = max(0.3, float(no_commit_force_sec))
     asr.max_active_no_commit_sec = max(0.5, float(max_active_no_commit_sec))
+    asr.beams = max(1, int(beams))
+    asr.transcribe_kargs["beam_size"] = asr.beams
     asr.condition_on_previous_text = bool(condition_on_previous_text)
     if compression_ratio_threshold is None:
         asr.transcribe_kargs.pop("compression_ratio_threshold", None)

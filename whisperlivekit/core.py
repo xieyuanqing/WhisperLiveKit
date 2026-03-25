@@ -131,6 +131,7 @@ class TranscriptionEngine:
                     "long_silence_reset_sec": config.long_silence_reset_sec,
                     "no_commit_force_sec": config.no_commit_force_sec,
                     "max_active_no_commit_sec": config.max_active_no_commit_sec,
+                    "beams": config.beams,
                     "condition_on_previous_text": config.condition_on_previous_text,
                     "compression_ratio_threshold": config.compression_ratio_threshold,
                     "no_speech_threshold": config.no_speech_threshold,
