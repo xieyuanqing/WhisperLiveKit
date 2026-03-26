@@ -1,4 +1,5 @@
 import logging
+import string
 import sys
 from typing import List, Optional, Tuple
 
@@ -11,6 +12,53 @@ logger = logging.getLogger(__name__)
 LONG_SILENCE_RESET_SEC = 1.2
 NO_COMMIT_FORCE_SEC = 1.6
 MAX_ACTIVE_NO_COMMIT_SEC = 13.0
+HALLUCINATION_PHRASE_BLACKLIST = frozenset({
+    "ご視聴ありがとうございました",
+    "ご視聴ありがとうございます",
+    "ありがとうございました",
+    "チャンネル登録お願いします",
+    "チャンネル登録よろしくお願いします",
+    "また次の動画でお会いしましょう",
+    "次の動画でお会いしましょう",
+    "いいねボタンを押してください",
+    "高評価お願いします",
+})
+_HALLUCINATION_PUNCTUATION = set(string.punctuation) | {
+    "。",
+    "，",
+    "、",
+    "！",
+    "？",
+    "：",
+    "；",
+    "（",
+    "）",
+    "【",
+    "】",
+    "《",
+    "》",
+    "“",
+    "”",
+    "‘",
+    "’",
+    "…",
+    "—",
+    "－",
+    "～",
+}
+
+
+def _normalize_hallucination_phrase(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    return "".join(char for char in text.strip() if not char.isspace() and char not in _HALLUCINATION_PUNCTUATION)
+
+
+def _is_blacklisted_standalone_text(text: Optional[str]) -> bool:
+    normalized = _normalize_hallucination_phrase(text)
+    if not normalized:
+        return False
+    return any(normalized == _normalize_hallucination_phrase(phrase) for phrase in HALLUCINATION_PHRASE_BLACKLIST)
 
 class HypothesisBuffer:
     """
@@ -269,7 +317,20 @@ class OnlineASRProcessor:
         """
         Get the unvalidated buffer in string format.
         """
-        return self.concatenate_tokens(self.transcript_buffer.buffer)
+        return self._sanitize_transcript(self.concatenate_tokens(self.transcript_buffer.buffer))
+
+    def _sanitize_transcript(self, transcript: Transcript) -> Transcript:
+        if transcript and _is_blacklisted_standalone_text(transcript.text):
+            logger.info("Suppressing blacklisted hallucination phrase from partial buffer: %s", transcript.text)
+            return Transcript(start=transcript.start, end=transcript.end, text="")
+        return transcript
+
+    def _filter_emitted_tokens(self, tokens: List[ASRToken], *, source: str) -> List[ASRToken]:
+        transcript = self.concatenate_tokens(tokens)
+        if transcript and _is_blacklisted_standalone_text(transcript.text):
+            logger.info("Suppressing blacklisted hallucination phrase from %s output: %s", source, transcript.text)
+            return []
+        return tokens
         
 
     def process_iter(self) -> Tuple[List[ASRToken], float]:
@@ -286,18 +347,19 @@ class OnlineASRProcessor:
         res = self.asr.transcribe(self.audio_buffer, init_prompt=prompt_text)
         tokens = self.asr.ts_words(res)
         self.transcript_buffer.insert(tokens, self.buffer_time_offset)
-        committed_tokens = self.transcript_buffer.flush()
+        raw_committed_tokens = self.transcript_buffer.flush()
+        committed_tokens = self._filter_emitted_tokens(raw_committed_tokens, source="committed")
         self.committed.extend(committed_tokens)
 
-        if committed_tokens:
-            self.time_of_last_asr_output = self.committed[-1].end
+        if raw_committed_tokens:
+            self.time_of_last_asr_output = raw_committed_tokens[-1].end
 
         completed = self.concatenate_tokens(committed_tokens)
         logger.debug(f">>>> COMPLETE NOW: {completed.text}")
         incomp = self.concatenate_tokens(self.transcript_buffer.buffer)
         logger.debug(f"INCOMPLETE: {incomp.text}")
 
-        if not committed_tokens and self.transcript_buffer.buffer:
+        if not raw_committed_tokens and self.transcript_buffer.buffer:
             if self.time_of_last_asr_output > 0:
                 reference_time = self.time_of_last_asr_output
                 reference_label = "last_commit"
@@ -317,7 +379,7 @@ class OnlineASRProcessor:
                 committed_tokens = self._force_commit_pending_buffer()
 
         buffer_duration = len(self.audio_buffer) / self.SAMPLING_RATE
-        if not committed_tokens and not self.transcript_buffer.buffer:
+        if not raw_committed_tokens and not self.transcript_buffer.buffer:
             if self.time_of_last_asr_output > 0:
                 no_output_reference = self.time_of_last_asr_output
             else:
@@ -353,10 +415,12 @@ class OnlineASRProcessor:
         return committed_tokens, current_audio_processed_upto
 
     def _force_commit_pending_buffer(self) -> List[ASRToken]:
-        forced_tokens = self.transcript_buffer.force_commit_buffer()
+        raw_forced_tokens = self.transcript_buffer.force_commit_buffer()
+        forced_tokens = self._filter_emitted_tokens(raw_forced_tokens, source="force-commit")
+        if raw_forced_tokens:
+            self.time_of_last_asr_output = raw_forced_tokens[-1].end
         if forced_tokens:
             self.committed.extend(forced_tokens)
-            self.time_of_last_asr_output = forced_tokens[-1].end
             logger.debug(
                 "FORCED COMMIT ON SILENCE: %s",
                 self.asr.sep.join(token.text for token in forced_tokens),
